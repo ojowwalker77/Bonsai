@@ -31,9 +31,6 @@ extension Notification.Name {
   static let composerCanvasMagnify = Notification.Name("composerCanvasMagnify")
   /// Number shortcuts use a 1-based `index`; named shortcuts such as P carry a `CanvasTool`.
   static let composerSelectTool = Notification.Name("composerSelectTool")
-  /// ⌘K "Add point to graph…": the graph card whose id matches `object` (a UUID) opens its Point
-  /// Composer seeded at the middle of its axis ranges.
-  static let composerAddGraphPoint = Notification.Name("composerAddGraphPoint")
   /// ⌘K toggles the command palette (board switcher + buried board-level actions).
   static let composerTogglePalette = Notification.Name("composerTogglePalette")
   /// ⇧⌘F expands the current text card into the centered focus-writing sheet (and back).

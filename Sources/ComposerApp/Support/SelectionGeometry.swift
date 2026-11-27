@@ -67,6 +67,9 @@ struct SelectionChrome: Equatable {
   static let portHitRadius: CGFloat = 11
   /// The delete button floats this far above the top-trailing handle.
   static let deleteLift: CGFloat = 22
+  /// Past this many selected elements the group box stands alone: a thin outline per member is
+  /// noise at that density, and laying thousands of them out on every frame of a pan is not free.
+  static let memberOutlineLimit = 200
 
   /// Each selected element's own outline (viewport), drawn thin when several are selected.
   var elementOutlines: [CGRect] = []
@@ -166,6 +169,25 @@ struct SelectionChrome: Equatable {
     // members stay put.
     if interactive, selected.contains(where: { !$0.locked }) {
       if selected.allSatisfy({ !$0.locked }) { chrome.handles = SelectionHandle.corners }
+      chrome.deleteCenter = CGPoint(x: box.maxX, y: box.minY - deleteLift)
+    }
+    return chrome
+  }
+
+  /// The chrome of a selection too large to outline member by member: the group box alone, from
+  /// the selection's bounds (board space).
+  static func resolve(group bounds: CGRect,
+                      hasUnlocked: Bool,
+                      hasLocked: Bool,
+                      viewport: CanvasViewport,
+                      interactive: Bool) -> SelectionChrome {
+    var chrome = SelectionChrome()
+    let box = viewport.viewportRect(bounds).insetBy(dx: -gap, dy: -gap)
+    chrome.isMultiple = true
+    chrome.box = box
+    chrome.boxCornerRadius = 4
+    if interactive, hasUnlocked {
+      if !hasLocked { chrome.handles = SelectionHandle.corners }
       chrome.deleteCenter = CGPoint(x: box.maxX, y: box.minY - deleteLift)
     }
     return chrome

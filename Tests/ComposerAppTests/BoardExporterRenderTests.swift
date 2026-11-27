@@ -203,9 +203,7 @@ final class BoardExporterRenderTests: XCTestCase {
     let path = VectorPathGeometry.path(
       for: spec, in: CGRect(origin: .zero, size: card.frame.size))
     XCTAssertTrue(path.contains(localInterior), "the selected fill sample must be inside the path")
-    let interior = try XCTUnwrap(rep.colorAt(
-      x: rep.pixelsWide / 2,
-      y: rep.pixelsHigh / 2)?.usingColorSpace(.sRGB))
+    let interior = try XCTUnwrap(sample(rep, x: rep.pixelsWide / 2, y: rep.pixelsHigh / 2))
     XCTAssertFalse(
       colorsClose(interior, canvas, tolerance: 0.03),
       "closed vector interior should contain its tint fill; got \(rgbString(interior))")
@@ -414,6 +412,17 @@ final class BoardExporterRenderTests: XCTestCase {
     if let rep = image.representations.compactMap({ $0 as? NSBitmapImageRep }).first { return rep }
     guard let tiff = image.tiffRepresentation else { return nil }
     return NSBitmapImageRep(data: tiff)
+  }
+
+  /// A pixel in the space the bitmap declares. `colorAt` hands back the stored components tagged
+  /// Generic RGB whatever the bitmap's real space is, which shifts a light color by up to 0.02 on
+  /// the way to sRGB — enough to hide an 8% tint fill inside `colorsClose`'s tolerance.
+  private func sample(_ rep: NSBitmapImageRep, x: Int, y: Int) -> NSColor? {
+    guard let raw = rep.colorAt(x: x, y: y) else { return nil }
+    var components = [CGFloat](repeating: 0, count: raw.numberOfComponents)
+    raw.getComponents(&components)
+    return NSColor(colorSpace: rep.colorSpace, components: components, count: components.count)
+      .usingColorSpace(.sRGB)
   }
 
   private func colorsClose(_ a: NSColor, _ b: NSColor, tolerance: CGFloat) -> Bool {

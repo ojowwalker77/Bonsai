@@ -10,11 +10,18 @@ struct SelectionOverlay: View {
 
   var body: some View {
     ZStack(alignment: .topLeading) {
-      ForEach(Array(chrome.elementOutlines.enumerated()), id: \.offset) { _, rect in
-        RoundedRectangle(cornerRadius: 3, style: .continuous)
-          .strokeBorder(Theme.Palette.accent.opacity(0.45), lineWidth: 1)
-          .frame(width: max(rect.width, 1), height: max(rect.height, 1))
-          .position(x: rect.midX, y: rect.midY)
+      // Every member outline in ONE path: a view per selected element is a view hierarchy that
+      // grows with the selection and is laid out again on every frame of a pan.
+      if !chrome.elementOutlines.isEmpty {
+        Path { path in
+          for rect in chrome.elementOutlines {
+            // Inset by half the line, so the stroke sits inside the rect as a border would.
+            let outline = CGRect(x: rect.minX, y: rect.minY, width: max(rect.width, 1), height: max(rect.height, 1))
+              .insetBy(dx: 0.5, dy: 0.5)
+            path.addRoundedRect(in: outline, cornerSize: CGSize(width: 2.5, height: 2.5), style: .continuous)
+          }
+        }
+        .stroke(Theme.Palette.accent.opacity(0.45), lineWidth: 1)
       }
 
       if let box = chrome.box {

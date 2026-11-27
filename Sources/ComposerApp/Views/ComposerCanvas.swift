@@ -77,6 +77,8 @@ struct ComposerCanvas: View {
   // Board transform. Committed scale/pan live in the retained workspace so changing the theme or
   // language does not teleport the user back to the origin. The in-flight gesture remains local.
   @State private var panLive: CGSize = .zero
+  /// A point composer waiting for its graph's live layer (see `requestGraphPoint`).
+  @State private var graphPointRequest: GraphPointRequest?
 
   /// The ⇧⌘F writing sheet's card. Separate from `editingCardID` on purpose: text edits inline on
   /// the board; the centered sheet is an explicit summon, not what double-click does.
@@ -214,7 +216,7 @@ struct ComposerCanvas: View {
         ActiveCardOverlays(
           card: editing,
           size: proxy.size,
-          currentTint: board.cards.first(where: { $0.id == editing.id })?.tint,
+          currentTint: board.renderedCard(editing.id)?.tint,
           onFormat: { editing.controller.applyMarkdown($0) },
           onTint: { slot in
             // A live text selection inks just that range; a bare caret falls back to whole-card tint.
@@ -404,27 +406,27 @@ struct ComposerCanvas: View {
             height: pan.height + panLive.height))
       }
 
-      // The card layer is isolated and `Equatable` so SwiftUI skips rebuilding every card when only a
-      // transient gesture changed (draw / freehand / selection rect / pan / zoom). The live pan
-      // offset is applied OUTSIDE it, so panning slides the already-built layer instead of
-      // re-evaluating a single card — this is what closes the "feels heavy" gap with the capture
-      // overlay. Off-screen cards are still culled before the layer builds them.
-      BoardCardLayer(
-        cards: visibleCards(in: viewportSize),
+      // The board itself: every element, drawn in one cached pass (see `BoardRenderView`). Pan and
+      // zoom move its tiles on the GPU; an edit repaints only the tiles under what changed.
+      BoardSurface(board: board, workspace: workspace, panLive: panLive, selectable: tool == .select)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(false)
+
+      // Above it, only the elements that are more than pixels right now: the one under an inline
+      // edit, and a selected graph's interaction layer. `Equatable`, so a pan or a drag elsewhere
+      // on the board never re-evaluates them.
+      LiveCardLayer(
+        cards: liveCards,
         board: board,
-        selectedCardIDs: board.selectedCardIDs,
+        selectedCardIDs: board.selectedCardIDs.count <= 12 ? board.selectedCardIDs : [],
         editingCardID: board.editingCardID,
         scale: effectiveScale,
         selectable: tool == .select,
-        equationDropTargetID: board.equationDropTargetID,
-        textScaleFactors: board.gesturePreview.textScaleFactors,
-        floatingCardID: board.floatingCardID
+        pointRequest: graphPointRequest,
+        onPointRequestHandled: { graphPointRequest = nil }
       )
       .equatable()
       .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-      // Layout-based zoom: each card sizes/positions itself in screen space (frame × scale) and
-      // renders its text at the zoomed font, so it stays crisp instead of being a stretched bitmap.
-      // Only `pan` translates the whole layer; the scale lives inside the cards now.
       .offset(x: pan.width + panLive.width, y: pan.height + panLive.height)
 
       SelectionOverlay(chrome: selectionChrome, onDelete: { handleDeleteSelection() })
@@ -454,11 +456,27 @@ struct ComposerCanvas: View {
     )
   }
 
+  /// The elements with a live SwiftUI layer right now (see `BoardCardView`).
+  private var liveCards: [CardState] {
+    var ids: [UUID] = []
+    if let id = board.editingCardID { ids.append(id) }
+    ids.append(contentsOf: board.interactiveGraphIDs(selectable: tool == .select))
+    if let id = board.floatingCardID { ids.append(id) }
+    if let id = graphPointRequest?.cardID { ids.append(id) }
+    var seen = Set<UUID>()
+    return ids.filter { seen.insert($0).inserted }.compactMap { board.renderedCard($0) }
+  }
+
+  /// ⌘K "Add point to graph…" and ⌥-click on a plot: select the graph and hand its live layer the
+  /// request (the layer mounts for it if it was not already up).
+  private func requestGraphPoint(_ id: UUID, seed: CardState.GraphPoint? = nil) {
+    board.select(id)
+    graphPointRequest = GraphPointRequest(cardID: id, seed: seed)
+  }
+
   /// The one selection box, laid out from the board as currently drawn.
   private var selectionChrome: SelectionChrome {
-    let selected = board.renderedCards.filter { board.selectedCardIDs.contains($0.id) }
-    return SelectionChrome.resolve(selected: selected, editingID: board.editingCardID,
-                                   viewport: viewport, interactive: tool == .select)
+    board.selectionChrome(viewport: viewport, interactive: tool == .select)
   }
 
   private var selectGestureCallbacks: CanvasSelectGesture.Callbacks {
@@ -469,7 +487,7 @@ struct ComposerCanvas: View {
         connectorDraft = segment.map { QuickConnectDraft(segment: $0, kind: kind, targetID: target) }
       },
       openPointComposer: { id, seed in
-        NotificationCenter.default.post(name: .composerAddGraphPoint, object: id, userInfo: ["point": seed])
+        requestGraphPoint(id, seed: seed)
       },
       pressed: { if promotion != nil { dismissPromotion() } })
   }
@@ -1582,15 +1600,6 @@ struct ComposerCanvas: View {
     return allowPanZoom()
   }
 
-  private func visibleCards(in viewportSize: CGSize) -> [CardState] {
-    let visible = viewport.visibleBoardRect(in: viewportSize, margin: 240)
-    return board.renderedCards.filter {
-      $0.frame.intersects(visible) ||
-      board.selectedCardIDs.contains($0.id) ||
-      board.editingCardID == $0.id
-    }
-  }
-
   /// Frame the board within the card viewport at a comfortable margin. Frames the current
   /// selection when there is one (so "Fit" can zoom to what you picked), unless `forceAll` asks for
   /// the whole board — used by the agent's tidy/relayout so it never snaps to a stray selection.
@@ -1988,7 +1997,7 @@ struct ComposerCanvas: View {
       }
       if kind == .graph {
         commands.append(PaletteCommand(id: "graph-add-point", title: "Add point to graph...".localizedUI, symbol: "smallcircle.filled.circle") {
-          NotificationCenter.default.post(name: .composerAddGraphPoint, object: card.id)
+          requestGraphPoint(card.id)
         })
       }
     }
@@ -2960,42 +2969,28 @@ private struct ActiveCardOverlays: View {
   }
 }
 
-/// The board's card layer, pulled out of the canvas body and made `Equatable` so SwiftUI re-renders
-/// the cards only when something that actually affects how they draw changes — never for a transient
-/// gesture (draw / freehand / selection rect / live pan), which all mutate canvas `@State` that this
-/// layer doesn't depend on. The comparison covers exactly that state: the visible cards themselves,
-/// the selection/editing/primary ids, the zoom, the select-tool gate, and the equation drop target.
+/// The board's live layer: the few elements with a SwiftUI presence right now (an inline edit, a
+/// selected graph's interaction layer). `Equatable` so it is re-evaluated only when one of THOSE
+/// changes — never for a pan, a zoom, or a drag elsewhere on the board.
 ///
-/// `board` is excluded from `==` on purpose — it is one stable instance, so comparing it would be
-/// meaningless.
-///
-/// Each `BoardCardView` still observes its own `CardInteraction`, so editing/typing a card re-renders
-/// just that card even while this whole layer is skipped — the same way the capture overlay stays
-/// immediate.
-struct BoardCardLayer: View, Equatable {
+/// `board` is excluded from `==` on purpose: it is one stable instance.
+struct LiveCardLayer: View, Equatable {
   let cards: [CardState]
   let board: BoardViewModel
   let selectedCardIDs: Set<UUID>
   let editingCardID: UUID?
   let scale: CGFloat
   let selectable: Bool
-  /// The graph card a parseable equation is currently dragged over (its accent drop-ring). Included
-  /// in `==` so the ring appears/clears mid-drag even though nothing in `cards` changes.
-  let equationDropTargetID: UUID?
-  /// Text elements mid corner-scale (see `BoardViewModel.GesturePreview`).
-  let textScaleFactors: [UUID: CGFloat]
-  /// A card whose interactive overlay is open (a graph's point composer) and must stay on top.
-  var floatingCardID: UUID? = nil
+  var pointRequest: GraphPointRequest? = nil
+  var onPointRequestHandled: () -> Void = {}
 
-  static func == (lhs: BoardCardLayer, rhs: BoardCardLayer) -> Bool {
+  static func == (lhs: LiveCardLayer, rhs: LiveCardLayer) -> Bool {
     lhs.cards == rhs.cards &&
       lhs.selectedCardIDs == rhs.selectedCardIDs &&
       lhs.editingCardID == rhs.editingCardID &&
       lhs.scale == rhs.scale &&
       lhs.selectable == rhs.selectable &&
-      lhs.equationDropTargetID == rhs.equationDropTargetID &&
-      lhs.textScaleFactors == rhs.textScaleFactors &&
-      lhs.floatingCardID == rhs.floatingCardID
+      lhs.pointRequest == rhs.pointRequest
   }
 
   var body: some View {
@@ -3009,15 +3004,67 @@ struct BoardCardLayer: View, Equatable {
           scale: scale,
           board: board,
           selectable: selectable,
-          textPreviewScale: textScaleFactors[card.id] ?? 1
+          pointRequest: pointRequest?.cardID == card.id ? pointRequest : nil,
+          onPointRequestHandled: onPointRequestHandled
         )
-        // Paint order is the board's z-order: selecting an element never lifts it above the
-        // elements covering it (the old +10 000 selection lift reordered the board on every
-        // click). Only a live editor — the inline text editor, a graph's point composer — floats
-        // on top, as Excalidraw's does, so what you type is never hidden under a shape.
-        .zIndex(Double(card.z) + (editingCardID == card.id || floatingCardID == card.id ? 1_000_000 : 0))
       }
     }
+  }
+}
+
+/// SwiftUI's handle on the board renderer.
+///
+/// The representable observes the board and the viewport ITSELF. SwiftUI calls `updateNSView`
+/// only when the representable's own inputs change, and a drag, an edit or a new element changes
+/// none of its stored values — the board is the same object throughout — so a wrapper that
+/// observed on its behalf would leave the picture stale until the next pan.
+struct BoardSurface: NSViewRepresentable {
+  @ObservedObject var board: BoardViewModel
+  @ObservedObject var workspace: CanvasWorkspaceSession
+  /// A space-drag pan in flight, not yet folded into the workspace's pan.
+  var panLive: CGSize = .zero
+  var selectable = true
+
+  func makeNSView(context: Context) -> BoardRenderView {
+    BoardRenderView(frame: .zero)
+  }
+
+  func updateNSView(_ view: BoardRenderView, context: Context) {
+    let board = board, selectable = selectable
+    let viewport = CanvasViewport(scale: workspace.scale,
+                                  pan: CGSize(width: workspace.pan.width + panLive.width,
+                                              height: workspace.pan.height + panLive.height))
+    view.update(viewport: viewport) { BoardSceneInput.live(board: board, selectable: selectable) }
+  }
+}
+
+extension BoardSceneInput {
+  /// The board as it should be drawn this instant.
+  @MainActor
+  static func live(board: BoardViewModel, selectable: Bool, style: RenderStyle? = nil) -> BoardSceneInput {
+    // An inline edit draws its own element: the text editor, the pen-path node editor.
+    var hidden: Set<UUID> = []
+    if let id = board.editingCardID, let card = board.renderedCard(id),
+       card.elementKind == .text || card.elementKind == .vectorPath {
+      hidden.insert(id)
+    }
+    let preview = board.gesturePreview
+    return BoardSceneInput(
+      cards: board.cards,
+      cardsRevision: board.cardsRevision,
+      preview: preview.cards,
+      moved: preview.moved,
+      movedToken: preview.movedToken,
+      moveOffset: preview.offset,
+      textPreviewScales: preview.textScaleFactors,
+      hidden: hidden,
+      dropTarget: board.equationDropTargetID,
+      legendHidden: board.interactiveGraphIDs(selectable: selectable),
+      // Ending an edit captures the editor's text into the element without touching `cards`.
+      contentToken: board.editingCardID?.hashValue ?? 0,
+      style: style ?? .current,
+      text: { board.renderText(for: $0) },
+      ink: { board.ink(for: $0) })
   }
 }
 

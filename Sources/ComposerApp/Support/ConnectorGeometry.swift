@@ -184,37 +184,46 @@ enum ConnectorGeometry {
   /// targets no longer exist. This is shared by live mutations and read-only rendering snapshots.
   static func refreshing(in cards: [CardState]) -> [CardState] {
     var result = cards
-    let existing = Set(cards.map(\.id))
+    var slots: [UUID: Int] = [:]
+    slots.reserveCapacity(cards.count)
+    for (slot, card) in cards.enumerated() where slots[card.id] == nil { slots[card.id] = slot }
+    let existing = slots
     for index in result.indices where isConnector(result[index]) {
-      if let start = result[index].startBindingID, !existing.contains(start) {
+      if let start = result[index].startBindingID, existing[start] == nil {
         result[index].startBindingID = nil
         result[index].startBindingAnchor = nil
       }
-      if let end = result[index].endBindingID, !existing.contains(end) {
+      if let end = result[index].endBindingID, existing[end] == nil {
         result[index].endBindingID = nil
         result[index].endBindingAnchor = nil
       }
       if result[index].startBindingID != nil || result[index].endBindingID != nil {
-        result[index] = refreshed(result[index], among: result) ?? result[index]
+        // Resolved against the list as refreshed so far, as a scan of it would.
+        result[index] = refreshed(result[index], resolving: { id in slots[id].map { result[$0] } }) ?? result[index]
       }
     }
     return result
   }
 
-  /// Re-resolve ONE bound connector against `cards` (the live preview's geometry), so an arrow
-  /// follows a dragged shape before anything commits.
-  static func rerouted(_ connector: CardState, among cards: [CardState]) -> CardState? {
+  /// Re-resolve ONE bound connector against the live preview's geometry, so an arrow follows a
+  /// dragged shape before anything commits. Its targets are looked up through `card`: a drag
+  /// reroutes every frame and must not scan the board to find two cards.
+  static func rerouted(_ connector: CardState, resolving card: (UUID) -> CardState?) -> CardState? {
     guard isConnector(connector),
           connector.startBindingID != nil || connector.endBindingID != nil else { return nil }
-    return refreshed(connector, among: cards)
+    return refreshed(connector, resolving: card)
   }
 
   // MARK: Implementation
 
   private static func refreshed(_ connector: CardState, among cards: [CardState]) -> CardState? {
+    refreshed(connector, resolving: { id in cards.first { $0.id == id } })
+  }
+
+  private static func refreshed(_ connector: CardState, resolving card: (UUID) -> CardState?) -> CardState? {
     guard var resolved = endpoints(of: connector) else { return nil }
-    let source = connector.startBindingID.flatMap { id in cards.first { $0.id == id } }
-    let target = connector.endBindingID.flatMap { id in cards.first { $0.id == id } }
+    let source = connector.startBindingID.flatMap(card)
+    let target = connector.endBindingID.flatMap(card)
     let rawStart = source.map(center(of:)) ?? resolved.start
     let rawEnd = target.map(center(of:)) ?? resolved.end
 

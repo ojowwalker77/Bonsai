@@ -87,7 +87,9 @@ final class CardInteraction: ObservableObject, Identifiable {
 /// the only writer to the store for the current board.
 @MainActor
 final class BoardViewModel: ObservableObject {
-  private let store: DumpStore
+  /// The store this board saves to. Views that need a store take this one, never the shared
+  /// singleton, so a board built on an in-memory store stays entirely in memory.
+  let store: DumpStore
   private struct HistorySnapshot {
     var cards: [CardState]
     var selectedCardIDs: Set<UUID>
@@ -98,9 +100,46 @@ final class BoardViewModel: ObservableObject {
 
   /// Geometry + last-saved text + z-order, newest-placed last. Live text lives in the
   /// matching `CardInteraction`; `text` here is only the seed/persisted snapshot.
-  @Published private(set) var cards: [CardState] = []
+  @Published private(set) var cards: [CardState] = [] {
+    didSet { cardsRevision &+= 1 }
+  }
+  /// Bumped on every change to `cards`. The renderer diffs the board only when this moves, and the
+  /// id → slot index below is rebuilt only when a lookup misses after it has.
+  private(set) var cardsRevision = 0
+  private var slotByID: [UUID: Int] = [:]
+  private var slotRevision = -1
   /// Selected cards — show selection rings and receive group operations.
-  @Published private(set) var selectedCardIDs: Set<UUID> = []
+  @Published private(set) var selectedCardIDs: Set<UUID> = [] {
+    didSet { selectionRevision &+= 1 }
+  }
+  private var selectionRevision = 0
+
+  // What a drag asks of the board on every frame is answered once and kept while the board (and
+  // the selection) stay the ones it was answered for — a drag frame must not scan the board.
+  private struct MoveContext {
+    var cardsRevision: Int
+    var moving: Set<UUID>
+    /// The moving cards' union rect, at rest.
+    var union: CGRect?
+    var peers: SnapEngine.Peers
+  }
+  private var moveContext: MoveContext?
+  /// One move of the current selection: who moves, which connectors must follow, what to snap to.
+  private struct MoveSession {
+    var cardsRevision: Int
+    var selectionRevision: Int
+    var token: Int
+    /// The selection minus its locked cards.
+    var moving: Set<UUID>
+    /// Slots of the lines and arrows bound to a moving card that do not move themselves.
+    var followers: [Int]
+    var context: MoveContext
+  }
+  private var moveSession: MoveSession?
+  private var moveTokens = 0
+  /// The bounds of a large selection at rest, split by whether a move would carry them.
+  private var largeSelection: (cardsRevision: Int, selectionRevision: Int, movable: CGRect?, fixed: CGRect?)?
+  private var boundConnectors: (cardsRevision: Int, byTarget: [UUID: [Int]])?
   /// The lead selection. This is the card that gets destructive/action chrome when several
   /// cards are selected.
   @Published private(set) var primarySelectedCardID: UUID?
@@ -123,13 +162,35 @@ final class BoardViewModel: ObservableObject {
   /// the canvas draws `renderedCards`, so moved elements AND every arrow bound to them follow the
   /// pointer live. This is the only place in-flight geometry lives.
   struct GesturePreview: Equatable {
-    /// Whole replacement cards: the moved/resized elements plus each connector rerouted to follow.
+    /// Whole replacement cards: the resized elements, plus each connector rerouted to follow.
     var cards: [UUID: CardState] = [:]
+    /// The cards a move is carrying, every one translated by `offset`. One offset rather than a
+    /// replacement per card: dragging thousands of elements then costs what dragging one does, and
+    /// the renderer can slide them as a layer instead of redrawing them.
+    var moved: Set<UUID> = []
+    var offset: CGSize = .zero
+    /// Names `moved` — it changes whenever the set does — so previews compare without walking it.
+    var movedToken = 0
     /// A text element being corner-scaled previews as a geometric scale of its laid-out text
     /// (relaying it out at a new font every frame flickered and shed glyphs); the factor lives here.
     var textScaleFactors: [UUID: CGFloat] = [:]
 
-    var isEmpty: Bool { cards.isEmpty && textScaleFactors.isEmpty }
+    var isEmpty: Bool { cards.isEmpty && moved.isEmpty && textScaleFactors.isEmpty }
+
+    static func == (lhs: GesturePreview, rhs: GesturePreview) -> Bool {
+      lhs.movedToken == rhs.movedToken && lhs.offset == rhs.offset &&
+        lhs.textScaleFactors == rhs.textScaleFactors && lhs.cards == rhs.cards
+    }
+
+    /// `card` as this preview shows it.
+    func applied(to card: CardState) -> CardState {
+      if let replaced = cards[card.id] { return replaced }
+      guard moved.contains(card.id) else { return card }
+      var shifted = card
+      shifted.x += Double(offset.width)
+      shifted.y += Double(offset.height)
+      return shifted
+    }
   }
 
   @Published private(set) var gesturePreview = GesturePreview()
@@ -145,9 +206,6 @@ final class BoardViewModel: ObservableObject {
   private var movePreviewDelta: CGSize = .zero
   /// The undo step a whole gesture shares (see `beginTransaction`).
   private var openTransaction: (snapshot: HistorySnapshot, previousSuppressUndo: Bool)?
-  /// Measured checkbox rects per card, in card-local board units, reported by the renderer so the
-  /// one pointer owner can toggle a row without any card-level gesture.
-  private(set) var checkboxFrames: [UUID: [Int: CGRect]] = [:]
   private var nextZ = 1
   private var undoStack: [HistorySnapshot] = []
   private var redoStack: [HistorySnapshot] = []
@@ -255,6 +313,21 @@ final class BoardViewModel: ObservableObject {
     return interactions[card.id]?.plainText ?? card.text
   }
 
+  /// The text an element DRAWS — a text body, a shape or connector label, a sticky's body — with
+  /// any uncommitted edit applied. (`plainText(for:)` is the agent-facing serialization instead.)
+  func renderText(for card: CardState) -> String {
+    interactions[card.id]?.plainText ?? card.text
+  }
+
+  /// Selected graphs that show their interactive layer (hover readout, ✕-legend): select tool only,
+  /// and only for a selection small enough to be about the graphs themselves.
+  func interactiveGraphIDs(selectable: Bool) -> Set<UUID> {
+    guard selectable, !selectedCardIDs.isEmpty, selectedCardIDs.count <= 12 else { return [] }
+    return selectedCardIDs.filter { id in
+      id != editingCardID && card(id: id)?.elementKind == .graph
+    }
+  }
+
   /// The card's per-range ink, read from the live runtime bundle when present (so an unsaved
   /// inking is captured) and falling back to the persisted runs. Offsets always match
   /// `plainText(for:)` — both come from the same cache refresh.
@@ -270,17 +343,72 @@ final class BoardViewModel: ObservableObject {
   /// `cards` to avoid publishing the whole board on every layout callback, so viewport consumers
   /// must use this accessor rather than reading the persisted frame directly.
   func renderingFrame(for id: UUID) -> CGRect? {
-    liveTextFrames[id] ?? gesturePreview.cards[id]?.frame ?? cards.first(where: { $0.id == id })?.frame
+    liveTextFrames[id] ?? renderedCard(id)?.frame
   }
 
   /// The board as it is drawn right now: committed cards with any in-flight gesture applied.
   var renderedCards: [CardState] {
-    guard !gesturePreview.cards.isEmpty else { return cards }
-    return cards.map { gesturePreview.cards[$0.id] ?? $0 }
+    let preview = gesturePreview
+    guard !preview.cards.isEmpty || !preview.moved.isEmpty else { return cards }
+    return cards.map(preview.applied(to:))
   }
 
   func renderedCard(_ id: UUID) -> CardState? {
-    gesturePreview.cards[id] ?? card(id: id)
+    card(id: id).map(gesturePreview.applied(to:))
+  }
+
+  /// The selection as currently drawn, in board order — without walking the whole board for the
+  /// usual small selection.
+  var selectedRenderedCards: [CardState] {
+    guard !selectedCardIDs.isEmpty else { return [] }
+    guard selectedCardIDs.count * 4 < cards.count else {
+      return renderedCards.filter { selectedCardIDs.contains($0.id) }
+    }
+    let preview = gesturePreview
+    return selectedCardIDs
+      .compactMap { id in index(for: id).map { (slot: $0, card: preview.applied(to: cards[$0])) } }
+      .sorted { $0.slot < $1.slot }
+      .map(\.card)
+  }
+
+  /// The selection box and its handles for the board as currently drawn — the ONE layout the
+  /// overlay draws and the pointer hit-tests.
+  func selectionChrome(viewport: CanvasViewport, interactive: Bool) -> SelectionChrome {
+    if selectedCardIDs.count > SelectionChrome.memberOutlineLimit, let group = largeSelectionBounds() {
+      return .resolve(group: group.bounds, hasUnlocked: group.hasUnlocked, hasLocked: group.hasLocked,
+                      viewport: viewport, interactive: interactive)
+    }
+    return .resolve(selected: selectedRenderedCards, editingID: editingCardID,
+                    viewport: viewport, interactive: interactive)
+  }
+
+  /// Where a large selection is right now, without visiting its members: their bounds at rest are
+  /// kept, and a move only shifts the part it carries. Nil when a gesture is reshaping members
+  /// one by one (a resize), which is then laid out card by card.
+  private func largeSelectionBounds() -> (bounds: CGRect, hasUnlocked: Bool, hasLocked: Bool)? {
+    let preview = gesturePreview
+    guard !preview.cards.keys.contains(where: selectedCardIDs.contains) else { return nil }
+    if largeSelection?.cardsRevision != cardsRevision || largeSelection?.selectionRevision != selectionRevision {
+      var movable: CGRect?, fixed: CGRect?
+      for id in selectedCardIDs {
+        guard let slot = index(for: id) else { continue }
+        let bounds = ElementGeometry.bounds(of: cards[slot])
+        if cards[slot].locked {
+          fixed = fixed?.union(bounds) ?? bounds
+        } else {
+          movable = movable?.union(bounds) ?? bounds
+        }
+      }
+      largeSelection = (cardsRevision, selectionRevision, movable, fixed)
+    }
+    guard let rest = largeSelection else { return nil }
+    let carried = preview.moved.isEmpty
+      ? rest.movable
+      : rest.movable?.offsetBy(dx: preview.offset.width, dy: preview.offset.height)
+    guard let bounds = [carried, rest.fixed].compactMap({ $0 }).reduce(nil as CGRect?, { $0?.union($1) ?? $1 }) else {
+      return nil
+    }
+    return (bounds, rest.movable != nil, rest.fixed != nil)
   }
 
   // MARK: Live gesture preview
@@ -305,17 +433,17 @@ final class BoardViewModel: ObservableObject {
 
   private func previewReplacing(_ replacements: [UUID: CardState], textScaleFactors: [UUID: CGFloat]) {
     var previewed = replacements
-    let changed = Set(replacements.keys)
-    let followers = cards.filter { card in
-      ConnectorGeometry.isConnector(card) && !changed.contains(card.id) &&
-        ((card.startBindingID.map(changed.contains) ?? false) ||
-         (card.endBindingID.map(changed.contains) ?? false))
-    }
+    // Every connector bound to something that changed, and not itself replaced, follows it.
+    let followers = connectorsByTarget()
     if !followers.isEmpty {
-      let live = cards.map { replacements[$0.id] ?? $0 }
-      for connector in followers {
-        if let rerouted = ConnectorGeometry.rerouted(connector, among: live) {
-          previewed[connector.id] = rerouted
+      for id in replacements.keys {
+        for slot in followers[id] ?? [] {
+          let connector = cards[slot]
+          guard replacements[connector.id] == nil, previewed[connector.id] == nil else { continue }
+          let rerouted = ConnectorGeometry.rerouted(connector, resolving: { id in
+            replacements[id] ?? self.card(id: id)
+          })
+          if let rerouted { previewed[connector.id] = rerouted }
         }
       }
     }
@@ -323,17 +451,35 @@ final class BoardViewModel: ObservableObject {
     if next != gesturePreview { gesturePreview = next }
   }
 
+  /// The lines and arrows bound to each card (slots in `cards`), so a preview finds what must
+  /// follow a moved card without looking at the rest of the board.
+  private func connectorsByTarget() -> [UUID: [Int]] {
+    if let boundConnectors, boundConnectors.cardsRevision == cardsRevision { return boundConnectors.byTarget }
+    var byTarget: [UUID: [Int]] = [:]
+    for (slot, card) in cards.enumerated() where ConnectorGeometry.isConnector(card) {
+      if let start = card.startBindingID { byTarget[start, default: []].append(slot) }
+      if let end = card.endBindingID, end != card.startBindingID { byTarget[end, default: []].append(slot) }
+    }
+    boundConnectors = (cardsRevision, byTarget)
+    return byTarget
+  }
+
   func clearGesturePreview() {
     if !gesturePreview.isEmpty { gesturePreview = GesturePreview() }
   }
 
-  /// The renderer reports where each checklist checkbox actually landed (card-local board units).
-  func setCheckboxFrames(_ frames: [Int: CGRect], for id: UUID) {
-    if frames.isEmpty { checkboxFrames[id] = nil } else { checkboxFrames[id] = frames }
-  }
-
+  /// Where `id` sits in `cards`, in O(1). Mutating a card in place never moves it, so a cached
+  /// slot is trusted once verified; the index is rebuilt only when `cards` changed AND the cached
+  /// slot no longer holds that card (an insert, delete or reorder).
   private func index(for id: UUID) -> Int? {
-    cards.firstIndex { $0.id == id }
+    if let slot = slotByID[id], slot < cards.count, cards[slot].id == id { return slot }
+    guard slotRevision != cardsRevision else { return nil }
+    var slots: [UUID: Int] = [:]
+    slots.reserveCapacity(cards.count)
+    for (slot, card) in cards.enumerated() { slots[card.id] = slot }
+    slotByID = slots
+    slotRevision = cardsRevision
+    return slots[id]
   }
 
   private func selectionSet(for id: UUID) -> Set<UUID> {
@@ -348,7 +494,31 @@ final class BoardViewModel: ObservableObject {
   }
 
   private func unlockedIDs(in ids: Set<UUID>) -> Set<UUID> {
-    Set(cards.filter { ids.contains($0.id) && !$0.locked }.map(\.id))
+    ids.filter { id in index(for: id).map { !cards[$0].locked } ?? false }
+  }
+
+  /// The move of the current selection, worked out once per gesture: every later frame of the
+  /// drag only applies a new offset to it.
+  private func currentMoveSession() -> MoveSession {
+    if let moveSession, moveSession.cardsRevision == cardsRevision,
+       moveSession.selectionRevision == selectionRevision {
+      return moveSession
+    }
+    // A multi-selection can contain locked cards: only the unlocked subset moves.
+    let moving = unlockedIDs(in: selectedCardIDs)
+    var followers = Set<Int>()
+    let byTarget = connectorsByTarget()
+    if !byTarget.isEmpty {
+      for id in moving {
+        for slot in byTarget[id] ?? [] where !moving.contains(cards[slot].id) { followers.insert(slot) }
+      }
+    }
+    moveTokens += 1
+    let session = MoveSession(cardsRevision: cardsRevision, selectionRevision: selectionRevision,
+                              token: moveTokens, moving: moving, followers: followers.sorted(),
+                              context: moveContext(for: moving))
+    moveSession = session
+    return session
   }
 
   /// Single-click: select without entering text edit (Excalidraw — drag then moves it).
@@ -2190,17 +2360,39 @@ final class BoardViewModel: ObservableObject {
       if !snapGuides.isEmpty { snapGuides = [] }
       return proposed
     }
-    let movingFrames = cards.filter { movingIDs.contains($0.id) }.map(\.frame)
-    guard let union = Self.unionRect(movingFrames) else {
+    return snapped(proposed, in: moveContext(for: movingIDs), tolerance: tolerance)
+  }
+
+  private func snapped(_ proposed: CGSize, in context: MoveContext, tolerance: CGFloat) -> CGSize {
+    guard let union = context.union else {
       if !snapGuides.isEmpty { snapGuides = [] }
       return proposed
     }
-    let peers = cards
-      .filter { !movingIDs.contains($0.id) && !$0.isArchived }
-      .map(\.frame)
-    let result = SnapEngine.snap(moving: union, proposedDelta: proposed, others: peers, tolerance: tolerance)
+    let result = SnapEngine.snap(moving: union, proposedDelta: proposed, peers: context.peers, tolerance: tolerance)
     if snapGuides != result.guides { snapGuides = result.guides }
     return result.delta
+  }
+
+  /// The moving cards' union and their indexed peers: one pass over the board when a drag starts,
+  /// then reused for each of its frames.
+  private func moveContext(for movingIDs: Set<UUID>) -> MoveContext {
+    if let moveContext, moveContext.cardsRevision == cardsRevision, moveContext.moving == movingIDs {
+      return moveContext
+    }
+    var union: CGRect?
+    var peers: [CGRect] = []
+    peers.reserveCapacity(cards.count)
+    for card in cards {
+      if movingIDs.contains(card.id) {
+        union = union?.union(card.frame) ?? card.frame
+      } else if !card.isArchived {
+        peers.append(card.frame)
+      }
+    }
+    let context = MoveContext(cardsRevision: cardsRevision, moving: movingIDs, union: union,
+                              peers: SnapEngine.Peers(peers))
+    moveContext = context
+    return context
   }
 
   /// The tight bounding box of `frames`, or nil when empty. Used to snap a multi-card move as one
@@ -2218,17 +2410,28 @@ final class BoardViewModel: ObservableObject {
   /// Move preview with alignment snapping. `tolerance` is the board-space snap threshold (the view
   /// passes `8 / zoom`); `0` disables snapping for callers that don't thread a zoom.
   func updateMovePreview(by rawDelta: CGSize, tolerance: CGFloat) {
-    let moving = unlockedIDs(in: selectedCardIDs)
-    // A multi-selection can contain locked cards: only the unlocked subset moves.
+    let session = currentMoveSession()
+    let moving = session.moving
     guard !moving.isEmpty else { return }
     movePreviewIDs = moving
-    let delta = snappedDelta(for: moving, proposed: rawDelta, tolerance: tolerance)
+    let delta = snapped(rawDelta, in: session.context, tolerance: tolerance)
     movePreviewDelta = delta
-    var frames: [UUID: CGRect] = [:]
-    for card in cards where moving.contains(card.id) {
-      frames[card.id] = card.frame.offsetBy(dx: delta.width, dy: delta.height)
+    // The moving cards are one offset; only the connectors left behind are re-derived.
+    var rerouted: [UUID: CardState] = [:]
+    for slot in session.followers {
+      let connector = cards[slot]
+      let follower = ConnectorGeometry.rerouted(connector, resolving: { id in
+        guard var target = self.card(id: id) else { return nil }
+        if moving.contains(id) {
+          target.x += Double(delta.width)
+          target.y += Double(delta.height)
+        }
+        return target
+      })
+      if let follower { rerouted[connector.id] = follower }
     }
-    previewFrames(frames)
+    let next = GesturePreview(cards: rerouted, moved: moving, offset: delta, movedToken: session.token)
+    if next != gesturePreview { gesturePreview = next }
     // finishMovePreview absorbs a lone unlocked equation into the graph under it, so the drop ring
     // must track this path too (it used to light up only for single-card drags — an absorb the
     // affordance never promised). ⌥-drag duplicates also flow through here.
@@ -2524,7 +2727,7 @@ final class BoardViewModel: ObservableObject {
   }
 
   private func card(id: UUID) -> CardState? {
-    cards.first { $0.id == id }
+    index(for: id).map { cards[$0] }
   }
 
   private static func center(of card: CardState) -> CGPoint {
