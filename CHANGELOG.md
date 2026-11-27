@@ -52,6 +52,7 @@ under the new version heading.
 - **Elements you drag ride above the rest until you let go,** then settle back into their layer.
 - **Selecting more than 200 elements shows one box around the group** rather than an outline per
   element.
+- **BonsAI has a new app icon:** a green bonsai on a dark tile.
 
 ### Fixed
 
