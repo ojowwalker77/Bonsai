@@ -4,9 +4,12 @@ import CoreGraphics
 /// Pure board-space snapping for card drags on the infinite canvas.
 ///
 /// The engine is deterministic and has no UI, actor, or persistence dependency. It compares the
-/// moved card's min, mid, and max anchors against every non-empty peer rect in O(n) time per axis,
-/// then returns the adjusted drag delta and merged guide lines for the alignments produced by that
-/// snap.
+/// moved card's min, mid, and max anchors against every non-empty peer rect, then returns the
+/// adjusted drag delta and merged guide lines for the alignments produced by that snap.
+///
+/// A drag asks the same question of the same peers every frame, so the peers are indexed once
+/// (`Peers`: their anchors sorted per axis) and each frame only visits the anchors within reach of
+/// the moving rect — a drag's snapping cost does not grow with the board.
 enum SnapEngine {
   enum Axis: Equatable { case horizontal, vertical }
 
@@ -26,6 +29,66 @@ enum SnapEngine {
     let guides: [Guide]
   }
 
+  /// The peer rects of one drag, indexed for lookup by anchor position.
+  struct Peers {
+    fileprivate struct Anchor {
+      var value: CGFloat
+      /// Index into `rects`.
+      var peer: Int
+      /// 0 = min, 1 = mid, 2 = max.
+      var index: Int
+    }
+
+    fileprivate let rects: [CGRect]
+    /// x anchors (they snap `.vertical` guides) and y anchors, each sorted by value.
+    private let xAnchors: [Anchor]
+    private let yAnchors: [Anchor]
+
+    var isEmpty: Bool { rects.isEmpty }
+
+    /// Empty or non-finite rects are skipped, so callers can pass the board's raw frame list.
+    init(_ others: [CGRect]) {
+      let rects = others.compactMap(SnapEngine.validRect)
+      var xs: [Anchor] = [], ys: [Anchor] = []
+      xs.reserveCapacity(rects.count * 3)
+      ys.reserveCapacity(rects.count * 3)
+      for (peer, rect) in rects.enumerated() {
+        let x = SnapEngine.anchors(for: .vertical, in: rect)
+        let y = SnapEngine.anchors(for: .horizontal, in: rect)
+        for index in 0..<3 {
+          xs.append(Anchor(value: x.value(at: index), peer: peer, index: index))
+          ys.append(Anchor(value: y.value(at: index), peer: peer, index: index))
+        }
+      }
+      xs.sort { $0.value < $1.value }
+      ys.sort { $0.value < $1.value }
+      self.rects = rects
+      xAnchors = xs
+      yAnchors = ys
+    }
+
+    /// The anchors on `axis` within `reach` of `value`, plus a hair either side: callers apply
+    /// their exact inclusion test, this only narrows what they look at.
+    fileprivate func anchors(on axis: Axis, near value: CGFloat, reach: CGFloat) -> ArraySlice<Anchor> {
+      let sorted = axis == .vertical ? xAnchors : yAnchors
+      guard value.isFinite, reach.isFinite else { return sorted[...] }
+      let slack = reach + max(abs(value), 1) * 1e-9
+      let low = value - slack, high = value + slack
+      var lower = 0, upper = sorted.count
+      while lower < upper {
+        let middle = (lower + upper) / 2
+        if sorted[middle].value < low { lower = middle + 1 } else { upper = middle }
+      }
+      let start = lower
+      upper = sorted.count
+      while lower < upper {
+        let middle = (lower + upper) / 2
+        if sorted[middle].value <= high { lower = middle + 1 } else { upper = middle }
+      }
+      return sorted[start..<lower]
+    }
+  }
+
   /// Snaps `moving.offsetBy(proposedDelta)` to nearby peer edges or centers.
   ///
   /// X and Y are solved independently. Candidates must be within `tolerance`; exact-boundary
@@ -37,11 +100,20 @@ enum SnapEngine {
     others: [CGRect],
     tolerance: CGFloat
   ) -> Result {
+    snap(moving: moving, proposedDelta: proposedDelta, peers: Peers(others), tolerance: tolerance)
+  }
+
+  /// The same snap against peers indexed once for the whole drag.
+  static func snap(
+    moving: CGRect,
+    proposedDelta: CGSize,
+    peers: Peers,
+    tolerance: CGFloat
+  ) -> Result {
     guard tolerance >= 0 else {
       return Result(delta: proposedDelta, guides: [])
     }
 
-    let peers = others.compactMap(Self.validRect)
     guard !peers.isEmpty else {
       return Result(delta: proposedDelta, guides: [])
     }
@@ -99,34 +171,31 @@ enum SnapEngine {
   private static func bestSnap(
     for axis: Axis,
     moving: CGRect,
-    others: [CGRect],
+    others: Peers,
     tolerance: CGFloat
   ) -> Candidate? {
     let movingAnchors = anchors(for: axis, in: moving)
     var best: Candidate?
 
-    for (otherIndex, other) in others.enumerated() {
-      let otherAnchors = anchors(for: axis, in: other)
-      let distance = centerDistanceSquared(from: moving, to: other)
+    // `isBetter` is a total order, so the winner does not depend on the order candidates are met.
+    for movingAnchorIndex in 0..<3 {
+      let movingValue = movingAnchors.value(at: movingAnchorIndex)
+      for anchor in others.anchors(on: axis, near: movingValue, reach: tolerance) {
+        let adjustment = anchor.value - movingValue
+        let absoluteAdjustment = abs(adjustment)
+        guard absoluteAdjustment <= tolerance else { continue }
 
-      for movingAnchorIndex in 0..<3 {
-        for otherAnchorIndex in 0..<3 {
-          let adjustment = otherAnchors.value(at: otherAnchorIndex) - movingAnchors.value(at: movingAnchorIndex)
-          let absoluteAdjustment = abs(adjustment)
-          guard absoluteAdjustment <= tolerance else { continue }
+        let candidate = Candidate(
+          adjustment: adjustment,
+          absoluteAdjustment: absoluteAdjustment,
+          centerDistanceSquared: centerDistanceSquared(from: moving, to: others.rects[anchor.peer]),
+          otherIndex: anchor.peer,
+          movingAnchorIndex: movingAnchorIndex,
+          otherAnchorIndex: anchor.index
+        )
 
-          let candidate = Candidate(
-            adjustment: adjustment,
-            absoluteAdjustment: absoluteAdjustment,
-            centerDistanceSquared: distance,
-            otherIndex: otherIndex,
-            movingAnchorIndex: movingAnchorIndex,
-            otherAnchorIndex: otherAnchorIndex
-          )
-
-          if isBetter(candidate, than: best) {
-            best = candidate
-          }
+        if isBetter(candidate, than: best) {
+          best = candidate
         }
       }
     }
@@ -151,7 +220,7 @@ enum SnapEngine {
     return candidate.otherAnchorIndex < best.otherAnchorIndex
   }
 
-  private static func guideLines(for axis: Axis, moving: CGRect, others: [CGRect]) -> [Guide] {
+  private static func guideLines(for axis: Axis, moving: CGRect, others: Peers) -> [Guide] {
     var guides: [Guide] = []
     let movingAnchors = anchors(for: axis, in: moving)
 
@@ -163,7 +232,10 @@ enum SnapEngine {
       var end = perpendicularMax(for: axis, in: moving)
       var foundPeer = false
 
-      for other in others where aligns(other, on: axis, at: position) {
+      // A peer aligns when any of its anchors sits on the line.
+      for anchor in others.anchors(on: axis, near: position, reach: 0.5)
+      where abs(anchor.value - position) <= 0.5 {
+        let other = others.rects[anchor.peer]
         foundPeer = true
         start = min(start, perpendicularMin(for: axis, in: other))
         end = max(end, perpendicularMax(for: axis, in: other))
@@ -202,14 +274,6 @@ enum SnapEngine {
     case .horizontal:
       return rect.maxX
     }
-  }
-
-  private static func aligns(_ rect: CGRect, on axis: Axis, at position: CGFloat) -> Bool {
-    let anchors = anchors(for: axis, in: rect)
-    for index in 0..<3 where abs(anchors.value(at: index) - position) <= 0.5 {
-      return true
-    }
-    return false
   }
 
   private static func containsGuide(in guides: [Guide], axis: Axis, position: CGFloat) -> Bool {

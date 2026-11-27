@@ -3,13 +3,15 @@ import ImageIO
 import SwiftMath
 import SwiftUI
 
-/// One element on the board — RENDER ONLY. Selection, moving, resizing, connector endpoints and
-/// quick-connect all belong to the canvas's single pointer owner (`CanvasSelectGesture`) and its
-/// one `SelectionOverlay`; this view never grabs the mouse except inside a live edit session (the
-/// inline text editor, the vector node editor) and the graph's own legend / point composer.
+/// The LIVE layer of one element: whatever about it is more than pixels right now.
 ///
-/// `card` arrives with any in-flight gesture already applied (`BoardViewModel.renderedCards`), so a
-/// drag's preview and its commit are drawn by exactly the same code.
+/// Every element is drawn by the board renderer (`BoardRenderView`). This view mounts only for the
+/// element in an inline edit session — the text editor, the pen-path node editor — and for a
+/// selected graph's interaction layer and point composer. Selection, moving, resizing, connector
+/// endpoints and quick-connect all belong to the canvas's single pointer owner
+/// (`CanvasSelectGesture`) and its one `SelectionOverlay`.
+///
+/// `card` arrives with any in-flight gesture already applied (`BoardViewModel.renderedCard`).
 struct BoardCardView: View {
   let card: CardState
   @ObservedObject var interaction: CardInteraction
@@ -20,8 +22,9 @@ struct BoardCardView: View {
   let board: BoardViewModel
   /// True only in the select tool, where a selected graph shows its interactive legend.
   let selectable: Bool
-  /// A text element mid corner-scale previews as a geometric scale of its laid-out text.
-  var textPreviewScale: CGFloat = 1
+  /// A pending "add a point here" aimed at this graph (⌥-click on the plot, ⌘K).
+  var pointRequest: GraphPointRequest? = nil
+  var onPointRequestHandled: () -> Void = {}
 
   /// Vector control previews remain local for the entire drag. Mouse-up commits the refitted spec
   /// and frame once through `BoardViewModel`, preserving one undo checkpoint per gesture.
@@ -32,15 +35,11 @@ struct BoardCardView: View {
   /// The ⌥-click Point Composer: prefilled X/Y (from the click's data coords), a label, and a tint
   /// swatch. Non-nil while the strip is up.
   @State private var pointComposer: PointComposerDraft?
-  /// Real rendered checkbox bounds in this card's screen-space coordinate system. Using measured
-  /// symbols avoids guessing row strides when text wraps or a text card has its own font scale.
-  @State private var checklistCheckboxFrames: [Int: CGRect] = [:]
 
-  private var radius: CGFloat { SelectionChrome.cornerRadius(for: card.elementKind) }
   private var zoom: CGFloat { max(scale, 0.01) }
   private var isTextElement: Bool { card.elementKind == .text }
   private var isGraphElement: Bool { card.elementKind == .graph }
-  private var checklistCoordinateSpace: String { "checklist-\(card.id.uuidString)" }
+  private var tint: Color? { Theme.tintColor(card.tint).map { Color(nsColor: $0) } }
 
   /// The frame to draw right now: the (preview-applied) card frame, or a live edit's own geometry.
   private var liveFrame: CGRect {
@@ -53,16 +52,17 @@ struct BoardCardView: View {
     cardBody
       .opacity(card.isArchived ? 0.4 : 1)   // superseded ideas fade but stay for lineage
       .frame(width: liveFrame.width * zoom, height: liveFrame.height * zoom, alignment: .topLeading)
-      .overlay(graphDropRing)
-      .overlay(lockBadge, alignment: .topLeading)
       .overlay(pointComposerPopover, alignment: .bottom)
       .offset(x: liveFrame.minX * zoom, y: liveFrame.minY * zoom)
-      .onAppear { board.setCardMounted(card.id, true) }
+      .onAppear {
+        board.setCardMounted(card.id, true)
+        openRequestedComposer()
+      }
       .onDisappear {
         board.setCardMounted(card.id, false)
-        board.setCheckboxFrames([:], for: card.id)
         if board.floatingCardID == card.id { board.floatingCardID = nil }
       }
+      .onChange(of: pointRequest) { _, _ in openRequestedComposer() }
       .onChange(of: interaction.text) { oldValue, newValue in
         // FreeWriteEditor writes serialized text here. Keeping the plain-text cache current lets
         // static cards and persistence read it without materializing an NSTextView controller.
@@ -87,21 +87,23 @@ struct BoardCardView: View {
           liveTextFrame = nil
         }
       }
-      .onReceive(NotificationCenter.default.publisher(for: .composerAddGraphPoint)) { note in
-        // ⌘K "Add point to graph…" and ⌥-click on the plot target a graph card by id; only that
-        // card responds, ensures it's selected, and opens the composer — at the clicked data point
-        // when one is given, else at the middle of its axis ranges.
-        guard isGraphElement, note.object as? UUID == card.id else { return }
-        board.select(card.id)
-        if let seed = note.userInfo?["point"] as? CardState.GraphPoint {
-          openPointComposer(at: seed)
-          return
-        }
-        let spec = card.graph ?? CardState.GraphSpec()
-        openPointComposer(at: CardState.GraphPoint(
-          x: GraphGeometry.roundToStep((spec.xMin + spec.xMax) / 2, span: spec.xMax - spec.xMin),
-          y: GraphGeometry.roundToStep((spec.yMin + spec.yMax) / 2, span: spec.yMax - spec.yMin)))
-      }
+  }
+
+  /// ⌘K "Add point to graph…" and ⌥-click on the plot target a graph by id: open the composer at
+  /// the clicked data point when one is given, else at the middle of the axis ranges.
+  private func openRequestedComposer() {
+    guard isGraphElement, let request = pointRequest, request.cardID == card.id else { return }
+    // Float first: the request clears below, and the open composer is what keeps this layer mounted.
+    board.floatingCardID = card.id
+    if let seed = request.seed {
+      openPointComposer(at: seed)
+    } else {
+      let spec = card.graph ?? CardState.GraphSpec()
+      openPointComposer(at: CardState.GraphPoint(
+        x: GraphGeometry.roundToStep((spec.xMin + spec.xMax) / 2, span: spec.xMax - spec.xMin),
+        y: GraphGeometry.roundToStep((spec.yMin + spec.yMax) / 2, span: spec.yMax - spec.yMin)))
+    }
+    onPointRequestHandled()
   }
 
   // MARK: Body
@@ -141,7 +143,7 @@ struct BoardCardView: View {
           fontScale: card.textScale,
           cardTint: { card.tint },
           controller: interaction.controller,
-          store: DumpStore.shared
+          store: board.store
         )
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -150,23 +152,11 @@ struct BoardCardView: View {
         // is layout-zoomed and stays crisp. Anchored top-left to line up with the static render.
         .frame(width: liveFrame.width, height: liveFrame.height, alignment: .topLeading)
         .scaleEffect(zoom, anchor: .topLeading)
-      } else {
-        // Non-editing cards render from the serialized plain text (image placeholders like
-        // "[image: …]" included). Fonts/padding scale with zoom so the text is laid out at screen
-        // size (crisp), not stretched.
-        CanvasElementContent(card: card, text: interaction.plainText, ink: board.ink(for: card), zoom: zoom * card.textScale, graphSelected: isGraphElement && isSelected && !isEditing, graphDropTarget: isGraphElement && board.equationDropTargetID == card.id, vectorSpec: liveVectorPlacement?.spec, checklistCoordinateSpace: checklistCoordinateSpace)
-          .padding(.horizontal, (isTextElement ? 16 : 0) * zoom)
-          .padding(.vertical, (isTextElement ? 18 : 0) * zoom)
+      } else if isEditing, card.elementKind == .vectorPath {
+        // The board renderer steps aside for a pen path under edit: dragging a handle refits the
+        // path every frame, and that preview is local to this view until mouse-up.
+        VectorPathShape(spec: liveVectorPlacement?.spec ?? card.vectorPath ?? VectorPathSpec(), tint: tint, zoom: zoom)
           .allowsHitTesting(false)
-          // An in-flight corner drag on a text card previews as a GEOMETRIC transform: the text
-          // keeps its base layout and scales as a whole. Re-laying it out at a new font size every
-          // gesture frame flickered and shed glyph fragments (1.4.5 feedback). The layout frame is
-          // the pre-drag size and the scale pins top-leading — the preview frame already moved its
-          // origin for the drag's anchor corner, so its top-left IS the scaled content's top-left.
-          .frame(width: liveFrame.width / textPreviewScale * zoom,
-                 height: liveFrame.height / textPreviewScale * zoom,
-                 alignment: .topLeading)
-          .scaleEffect(textPreviewScale, anchor: .topLeading)
       }
 
       if VectorPathNodeEditorPolicy.isVisible(isEditing: isEditing, kind: card.elementKind) {
@@ -177,33 +167,13 @@ struct BoardCardView: View {
       // region claims clicks) and a passive hover crosshair/readout. Plot-area presses (⌥-click,
       // marker drag) fall through to the canvas input view underneath.
       if isGraphElement, isSelected, !isEditing, selectable {
+        // Laid out at 100% and scaled, exactly as the renderer draws the graph beneath it.
         GraphInteractionOverlay(spec: card.graph ?? CardState.GraphSpec(), board: board, graphID: card.id,
                                 cardOrigin: liveFrame.origin, zoom: zoom)
+          .frame(width: liveFrame.width, height: liveFrame.height, alignment: .topLeading)
+          .scaleEffect(zoom, anchor: .topLeading)
+          .frame(width: liveFrame.width * zoom, height: liveFrame.height * zoom, alignment: .topLeading)
       }
-    }
-    .coordinateSpace(name: checklistCoordinateSpace)
-    .onPreferenceChange(ChecklistCheckboxFramesPreferenceKey.self) { frames in
-      guard checklistCheckboxFrames != frames else { return }
-      checklistCheckboxFrames = frames
-      // Hand the measured rows to the pointer owner in card-local BOARD units, so a press
-      // converts the same way at any zoom.
-      board.setCheckboxFrames(frames.mapValues { rect in
-        CGRect(x: rect.minX / zoom, y: rect.minY / zoom, width: rect.width / zoom, height: rect.height / zoom)
-      }, for: card.id)
-    }
-  }
-
-  // MARK: Graph drop ring
-
-  /// The accent ring a graph card shows while a parseable equation is dragged over it — a 2pt stroke
-  /// just inside the frame (the plot-rect lightening is drawn inside GraphCardView).
-  @ViewBuilder
-  private var graphDropRing: some View {
-    if isGraphElement, board.equationDropTargetID == card.id {
-      RoundedRectangle(cornerRadius: radius, style: .continuous)
-        .strokeBorder(Theme.Palette.accent, lineWidth: 2)
-        .padding(1)
-        .allowsHitTesting(false)
     }
   }
 
@@ -372,515 +342,26 @@ struct BoardCardView: View {
         board.setVectorPath(card.id, placement: placement)
       }
   }
-
-  @ViewBuilder
-  private var lockBadge: some View {
-    if card.locked {
-      Image(systemName: "lock.fill")
-        .font(.system(size: 10, weight: .bold))
-        .foregroundStyle(Theme.Palette.menuDesc)
-        .frame(width: 20, height: 20)
-        .background(Circle().fill(Theme.Palette.labelChipFill))
-        .overlay(Circle().strokeBorder(Theme.Palette.panelHairline, lineWidth: 1))
-        .offset(x: -7, y: -7)
-        .allowsHitTesting(false)
-    }
-  }
 }
 
-// MARK: - Element rendering
-
-private struct CanvasElementContent: View {
-  let card: CardState
-  /// Serialized plain text (`[image: …]` placeholders, literal prose) for text cards.
-  let text: String
-  /// Per-range text ink over `text` (serialized-offset spans), resolved to colors at render.
-  var ink: [InkRun] = []
-  /// Board zoom — fonts scale by it so text is laid out (and stays crisp) at screen size.
-  var zoom: CGFloat = 1
-  /// Graph-card display flags. `graphSelected` hands the ✕-legend to the interactive overlay (drawn
-  /// in cardBody); `graphDropTarget` lightens the plot for an incoming equation. Both false on export.
-  var graphSelected: Bool = false
-  var graphDropTarget: Bool = false
-  /// Optional normalized line/arrow endpoints used only for an in-flight endpoint drag preview.
-  var connectorPoints: [CanvasPoint]?
-  /// Refitted vector geometry used only during an in-flight node/handle edit preview.
-  var vectorSpec: VectorPathSpec?
-  /// Present only for live board cards. Export renderers omit it, so measuring interaction geometry
-  /// never changes exported content.
-  var checklistCoordinateSpace: String? = nil
-
-  /// The card's tint slot resolved against the ACTIVE flavor — semantic, so the same element
-  /// re-colors when the theme changes.
-  private var tint: Color? {
-    guard let slot = card.tint, Theme.flavor.tints.indices.contains(slot) else { return nil }
-    return Color(nsColor: Theme.flavor.tints[slot])
-  }
-
-  var body: some View {
-    ZStack {
-      Group {
-        switch card.elementKind {
-        case .text:
-          Group {
-            if text.trimmed.isEmpty {
-              Text("Brain dump...".localizedUI)
-                .font(ComposerPreferences.appSwiftUIFont(size: Theme.Typography.body.pointSize * zoom))
-                .lineSpacing(Theme.Typography.bodyLineSpacing * zoom)
-                .foregroundStyle(Theme.Palette.placeholder)
-            } else if Self.containsChecklist(text) {
-              InlineChecklistText(text: text, zoom: zoom, tint: tint,
-                                  checklistCoordinateSpace: checklistCoordinateSpace)
-            } else {
-              CardText(tint: tint, plain: text, ink: ink, zoom: zoom)
-            }
-          }
-          // The card height was measured by the AppKit editor at 100% zoom, but this static text
-          // is laid out by SwiftUI at fontSize × zoom — the two don't agree pixel-for-pixel and
-          // wrapping isn't scale-linear, so a fitted height can fall a line short at some zooms.
-          // Let the text take the height it needs instead of clipping: a few px of overflow past
-          // the card edge beats silently dropping the last line.
-          .fixedSize(horizontal: false, vertical: true)
-          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        case .rectangle:
-          ShapeBox(kind: .rectangle, tint: tint, zoom: zoom)
-        case .ellipse:
-          ShapeBox(kind: .ellipse, tint: tint, zoom: zoom)
-        case .diamond:
-          ShapeBox(kind: .diamond, tint: tint, zoom: zoom)
-        case .line:
-          LineShape(arrow: false, points: connectorPoints ?? card.points ?? CardState.defaultLinePoints(), tint: tint)
-        case .arrow:
-          LineShape(arrow: true, points: connectorPoints ?? card.points ?? CardState.defaultLinePoints(), tint: tint)
-        case .freehand:
-          FreehandShape(points: card.points ?? CardState.defaultFreehandPoints(), tint: tint)
-        case .vectorPath:
-          VectorPathShape(spec: vectorSpec ?? card.vectorPath ?? VectorPathSpec(), tint: tint)
-        case .image:
-          ImageObjectPlaceholder(path: card.imagePath)
-            .overlay(alignment: .bottomTrailing) {
-              // A captured screenshot that's been read on-device carries its text to agents over the
-              // canvas API; mark it so it doesn't look like an inert image.
-              if let understanding = card.imageUnderstanding, !understanding.isEmpty {
-                Image(systemName: "text.viewfinder")
-                  .font(.system(size: 11, weight: .semibold))
-                  .foregroundStyle(Theme.Palette.menuDesc)
-                  .padding(5)
-                  .background(Theme.Palette.labelChipFill, in: Circle())
-                  .padding(6)
-                  .help("Read on-device - agents can read this screenshot's text".localizedUI)
-              }
-            }
-        case .equation:
-          EquationView(latex: card.latex ?? "", tint: tint, zoom: zoom)
-        case .graph:
-          GraphCardView(spec: card.graph ?? CardState.GraphSpec(), tint: tint,
-                        isDropTarget: graphDropTarget, interactiveLegend: graphSelected)
-        case .sticky:
-          StickyNoteView(title: card.stickyTitle ?? "", bodyText: text, tint: tint, zoom: zoom)
-        case .checklist:
-          ChecklistView(items: card.checklist ?? [], tint: tint, zoom: zoom,
-                        checklistCoordinateSpace: checklistCoordinateSpace)
-        case .table:
-          SimpleTableView(spec: card.table ?? CardState.TableSpec(), tint: tint, zoom: zoom)
-        }
-      }
-
-      if !text.trimmed.isEmpty {
-        switch card.elementKind {
-        case .rectangle, .ellipse, .diamond:
-          // A diagram node: the label fills the box (the box is the boundary).
-          NodeLabel(text: text.trimmed, zoom: zoom, tint: tint)
-        case .arrow, .line:
-          // A connector label: a floating pill so it stays legible over the canvas.
-          CanvasLabel(text: text.trimmed, zoom: zoom)
-        default:
-          EmptyView()
-        }
-      }
-    }
-  }
-
-  private static func containsChecklist(_ text: String) -> Bool {
-    text.components(separatedBy: "\n").contains { $0.hasPrefix("- [ ] ") || $0.lowercased().hasPrefix("- [x] ") }
-  }
+/// A request to open a graph's point composer, raised by the canvas and consumed by that graph's
+/// live layer once it is mounted.
+struct GraphPointRequest: Equatable {
+  var cardID: UUID
+  /// The data point to prefill; nil seeds the middle of the axis ranges.
+  var seed: CardState.GraphPoint?
+  var token = UUID()
 }
 
-private struct ChecklistCheckboxFramesPreferenceKey: PreferenceKey {
-  static var defaultValue: [Int: CGRect] = [:]
 
-  static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
-    value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
-  }
-}
+// MARK: - Pen path under edit
 
-private extension View {
-  @ViewBuilder
-  func reportChecklistCheckbox(index: Int, in coordinateSpace: String?) -> some View {
-    if let coordinateSpace {
-      background {
-        GeometryReader { proxy in
-          Color.clear.preference(
-            key: ChecklistCheckboxFramesPreferenceKey.self,
-            value: [index: proxy.frame(in: .named(coordinateSpace))])
-        }
-      }
-    } else {
-      self
-    }
-  }
-}
-
-private struct InlineChecklistText: View {
-  let text: String
-  let zoom: CGFloat
-  let tint: Color?
-  let checklistCoordinateSpace: String?
-  var body: some View {
-    VStack(alignment: .leading, spacing: 3 * zoom) {
-      ForEach(Array(text.components(separatedBy: "\n").enumerated()), id: \.offset) { index, line in
-        if line.hasPrefix("- [ ] ") || line.lowercased().hasPrefix("- [x] ") {
-          let checked = line.lowercased().hasPrefix("- [x] ")
-          HStack(spacing: 8 * zoom) {
-            Image(systemName: checked ? "checkmark.circle.fill" : "circle")
-              .foregroundStyle(checked ? (tint ?? Theme.Palette.accent) : Theme.Palette.menuDesc)
-              .reportChecklistCheckbox(index: index, in: checklistCoordinateSpace)
-            Text(String(line.dropFirst(6))).strikethrough(checked)
-          }
-          .foregroundStyle(checked ? Theme.Palette.menuDesc : (tint ?? Theme.Palette.body))
-        } else {
-          Text(line).foregroundStyle(tint ?? Theme.Palette.body)
-        }
-      }
-    }
-    .font(ComposerPreferences.appSwiftUIFont(size: Theme.Typography.body.pointSize * zoom))
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-  }
-}
-
-private struct StickyNoteView: View {
-  let title: String
-  let bodyText: String
-  let tint: Color?
-  let zoom: CGFloat
-  var body: some View {
-    VStack(alignment: .leading, spacing: 0) {
-      Text(title.trimmed.isEmpty ? "Untitled note".localizedUI : title)
-        .font(ComposerPreferences.appSwiftUIFont(size: 18 * zoom, weight: .semibold))
-        .foregroundStyle(title.trimmed.isEmpty ? Theme.Palette.placeholder : Theme.Palette.body)
-        .lineLimit(2)
-        .fixedSize(horizontal: false, vertical: true)
-
-      Rectangle()
-        .fill(Theme.Palette.body.opacity(0.13))
-        .frame(height: max(0.5, 0.75 * zoom))
-        .padding(.vertical, 12 * zoom)
-
-      Text(bodyText.trimmed.isEmpty ? "Write something…".localizedUI : bodyText)
-        .font(ComposerPreferences.appSwiftUIFont(size: 15 * zoom))
-        .foregroundStyle(bodyText.trimmed.isEmpty ? Theme.Palette.placeholder : Theme.Palette.body.opacity(0.88))
-        .lineSpacing(3 * zoom)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    .padding(18 * zoom)
-    .background(stickyFill, in: RoundedRectangle(cornerRadius: 14 * zoom, style: .continuous))
-    .overlay {
-      RoundedRectangle(cornerRadius: 14 * zoom, style: .continuous)
-        .strokeBorder(Theme.Palette.body.opacity(Theme.flavor.isDark ? 0.12 : 0.08), lineWidth: 1)
-    }
-    .shadow(color: Theme.Palette.elementShadow.opacity(0.45), radius: 8 * zoom, y: 3 * zoom)
-  }
-
-  private var stickyFill: Color {
-    (tint ?? Color.yellow).opacity(Theme.flavor.isDark ? 0.22 : 0.20)
-  }
-}
-
-private struct ChecklistView: View {
-  let items: [CardState.ChecklistItem]
-  let tint: Color?
-  let zoom: CGFloat
-  let checklistCoordinateSpace: String?
-  var body: some View {
-    VStack(alignment: .leading, spacing: 8 * zoom) {
-      ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-        HStack(alignment: .firstTextBaseline, spacing: 9 * zoom) {
-          Image(systemName: item.isChecked ? "checkmark.square.fill" : "square")
-            .foregroundStyle(item.isChecked ? (tint ?? Theme.Palette.accent) : Theme.Palette.menuDesc)
-            .reportChecklistCheckbox(index: index, in: checklistCoordinateSpace)
-          Text(item.text).strikethrough(item.isChecked).foregroundStyle(item.isChecked ? Theme.Palette.menuDesc : Theme.Palette.body)
-        }
-        .font(ComposerPreferences.appSwiftUIFont(size: 15 * zoom))
-        .frame(minHeight: 22 * zoom)
-      }
-    }
-    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    .padding(16 * zoom)
-    .background(Theme.Palette.raisedTint, in: RoundedRectangle(cornerRadius: 10 * zoom))
-  }
-}
-
-private struct SimpleTableView: View {
-  let spec: CardState.TableSpec
-  let tint: Color?
-  let zoom: CGFloat
-  var body: some View {
-    VStack(spacing: 0) {
-      tableRow(spec.columns, header: true, rowIndex: nil)
-      ForEach(Array(spec.rows.enumerated()), id: \.offset) { index, row in
-        tableRow(normalized(row), header: false, rowIndex: index)
-      }
-    }
-    .frame(maxWidth: .infinity, alignment: .topLeading)
-    .background(Theme.Palette.raisedTint.opacity(0.72))
-    .clipShape(RoundedRectangle(cornerRadius: 10 * zoom, style: .continuous))
-    .overlay {
-      RoundedRectangle(cornerRadius: 10 * zoom, style: .continuous)
-        .strokeBorder(Theme.Palette.panelHairline, lineWidth: 1)
-    }
-    .shadow(color: Theme.Palette.elementShadow.opacity(0.28), radius: 6 * zoom, y: 2 * zoom)
-  }
-
-  private func normalized(_ row: [String]) -> [String] {
-    Array((row + Array(repeating: "", count: max(0, spec.columns.count - row.count))).prefix(spec.columns.count))
-  }
-
-  private func tableRow(_ values: [String], header: Bool, rowIndex: Int?) -> some View {
-    HStack(spacing: 0) {
-      ForEach(Array(values.enumerated()), id: \.offset) { index, value in
-        Text(value.isEmpty && header ? "Column \(index + 1)" : value)
-          .font(ComposerPreferences.appSwiftUIFont(size: (header ? 12.5 : 13) * zoom,
-                                                    weight: header ? .semibold : .regular))
-          .foregroundStyle(header ? (tint ?? Theme.Palette.body) : Theme.Palette.body.opacity(0.88))
-          .lineLimit(2)
-          .frame(maxWidth: .infinity, minHeight: (header ? 40 : 38) * zoom, alignment: .leading)
-          .padding(.horizontal, 12 * zoom)
-          .overlay(alignment: .trailing) {
-            if index < values.count - 1 {
-              Rectangle().fill(Theme.Palette.separator.opacity(0.5)).frame(width: 0.5)
-            }
-          }
-      }
-    }
-    .background {
-      if header {
-        (tint ?? Theme.Palette.accent).opacity(Theme.flavor.isDark ? 0.16 : 0.10)
-      } else if let rowIndex, rowIndex.isMultiple(of: 2) {
-        Theme.Palette.body.opacity(Theme.flavor.isDark ? 0.025 : 0.018)
-      }
-    }
-    .overlay(alignment: .bottom) {
-      Rectangle().fill(Theme.Palette.separator.opacity(0.55)).frame(height: 0.5)
-    }
-  }
-}
-
-/// The centered label inside a diagram-node box. No pill background — the surrounding shape is the
-/// container — and it wraps to fit rather than truncating mid-word.
-private struct NodeLabel: View {
-  let text: String
-  var zoom: CGFloat = 1
-  var tint: Color?
-
-  var body: some View {
-    Text(text)
-      // Must match the face `BoardViewModel.fittedShapeSize` measures with, or boxes mis-fit.
-      .font(ComposerPreferences.appSwiftUIFont(size: 14 * zoom, weight: .semibold))
-      .multilineTextAlignment(.center)
-      // Board ink (or the element's tint) — ink on paper casts no shadow (elementShadow is clear
-      // on light themes).
-      .foregroundStyle(tint ?? Theme.Palette.body)
-      .shadow(color: Theme.Palette.elementShadow, radius: 3, y: 1)
-      // The sizing seam measures with this same cap. Without it, the larger diamond frame offers
-      // Text extra width, changes its wrap, and invalidates the measured containment block.
-      .frame(maxWidth: ShapeLabelGeometry.defaultMaximumContentWidth * zoom)
-      .padding(.horizontal, ShapeLabelGeometry.horizontalPadding * zoom)
-      .padding(.vertical, ShapeLabelGeometry.verticalPadding * zoom)
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .allowsHitTesting(false)
-  }
-}
-
-// MARK: - Static text (non-editing cards)
-
-/// Renders a card's serialized plain text — markdown spans and per-range ink — so a card looks the
-/// same whether or not it's being edited. Built as concatenated `Text` runs so it wraps natively
-/// and stays cheap; image placeholders show a small inline glyph (the real attachment only lives in
-/// the live editor).
-private struct CardText: View {
-  /// Base ink override (the card's tint).
-  var tint: Color? = nil
-  let plain: String
-  /// Per-range text ink (serialized-offset spans); each run recolors its characters over the base.
-  var ink: [InkRun] = []
-  /// Board zoom — the base font scales by it so the text is laid out at screen size.
-  var zoom: CGFloat = 1
-
-  var body: some View {
-    composed
-      .font(ComposerPreferences.appSwiftUIFont(size: Theme.Typography.body.pointSize * zoom))
-      .lineSpacing(Theme.Typography.bodyLineSpacing * zoom)
-      .foregroundStyle(tint ?? Theme.Palette.body)
-      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-  }
-
-  private var composed: Text {
-    let ns = plain as NSString
-    // Markdown spans over the whole plain text, styled into every gap between image placeholders.
-    // One scan per render; the ranges are UTF-16 offsets shared with the placeholder spans.
-    let markdown = MarkdownStyle.spans(in: plain)
-    func gapRun(_ range: NSRange) -> Text {
-      Text(MarkdownStyle.rendered(
-        slice: ns.substring(with: range), sliceRange: range, spans: markdown,
-        baseSize: Theme.Typography.body.pointSize, zoom: zoom, ink: ink))
-    }
-
-    var out = Text(verbatim: "")
-    var cursor = 0
-    for range in Self.imagePlaceholderRanges(in: plain) {
-      if range.location > cursor {
-        out = out + gapRun(NSRange(location: cursor, length: range.location - cursor))
-      }
-      out = out + Text(Image(systemName: "photo")).foregroundColor(Theme.Palette.placeholder)
-      cursor = range.location + range.length
-    }
-    if cursor < ns.length {
-      out = out + gapRun(NSRange(location: cursor, length: ns.length - cursor))
-    }
-    return out
-  }
-
-  /// `[image: …]` placeholders that `composerPlainText` writes for inline attachments.
-  private static let imagePlaceholderRegex = try? NSRegularExpression(pattern: "\\[image:[^\\]]*\\]")
-
-  private static func imagePlaceholderRanges(in text: String) -> [NSRange] {
-    guard let regex = imagePlaceholderRegex else { return [] }
-    let ns = text as NSString
-    return regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).map(\.range)
-  }
-}
-
-private struct CanvasLabel: View {
-  let text: String
-  var zoom: CGFloat = 1
-
-  var body: some View {
-    Text(text)
-      .font(ComposerPreferences.appSwiftUIFont(size: 14 * zoom, weight: .semibold))
-      .lineLimit(2)
-      .multilineTextAlignment(.center)
-      .foregroundStyle(Theme.Palette.body)
-      .padding(.horizontal, 9 * zoom)
-      .padding(.vertical, 5 * zoom)
-      .background(
-        // Solid fill — a translucent chip lets its own drop shadow bleed through and muddies it.
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
-          .fill(Theme.Palette.labelChipFill)
-          .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .strokeBorder(Theme.Palette.panelHairline, lineWidth: 1))
-      )
-      .shadow(color: Theme.Palette.elementShadow, radius: 4, y: 1)
-      .padding(8)
-      .allowsHitTesting(false)
-  }
-}
-
-private struct ShapeBox: View {
-  let kind: BoxShapeKind
-  var tint: Color?
-  var zoom: CGFloat = 1
-
-  var body: some View {
-    BoxShape(kind: kind)
-      .fill(tint.map { $0.opacity(Theme.flavor.isDark ? 0.16 : 0.10) } ?? Theme.Palette.elementFill)
-      .overlay(BoxShape(kind: kind).stroke(tint ?? Theme.Palette.elementStroke, lineWidth: 2))
-      .shadow(color: Theme.Palette.elementShadow, radius: 10, y: 4)
-      .padding(ShapeLabelGeometry.renderedShapePathInset(at: zoom))
-  }
-}
-
-private enum BoxShapeKind {
-  case rectangle
-  case ellipse
-  case diamond
-}
-
-private struct BoxShape: Shape {
-  let kind: BoxShapeKind
-
-  func path(in rect: CGRect) -> Path {
-    switch kind {
-    case .rectangle:
-      return RoundedRectangle(cornerRadius: 8, style: .continuous).path(in: rect)
-    case .ellipse:
-      return Ellipse().path(in: rect)
-    case .diamond:
-      var path = Path()
-      path.move(to: CGPoint(x: rect.midX, y: rect.minY))
-      path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
-      path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
-      path.addLine(to: CGPoint(x: rect.minX, y: rect.midY))
-      path.closeSubpath()
-      return path
-    }
-  }
-}
-
-private struct LineShape: View {
-  let arrow: Bool
-  let points: [CanvasPoint]
-  var tint: Color?
-
-  var body: some View {
-    GeometryReader { geo in
-      Path { path in
-        let normalizedStart = points.first?.cgPoint ?? CGPoint(x: 0.06, y: 0.88)
-        let normalizedEnd = points.dropFirst().first?.cgPoint ?? CGPoint(x: 0.94, y: 0.12)
-        let start = CGPoint(x: normalizedStart.x * geo.size.width, y: normalizedStart.y * geo.size.height)
-        let end = CGPoint(x: normalizedEnd.x * geo.size.width, y: normalizedEnd.y * geo.size.height)
-        path.move(to: start)
-        path.addLine(to: end)
-        if arrow {
-          let angle = atan2(end.y - start.y, end.x - start.x)
-          let head: CGFloat = 15
-          for side in [CGFloat.pi * 0.82, -CGFloat.pi * 0.82] {
-            let p = CGPoint(
-              x: end.x + cos(angle + side) * head,
-              y: end.y + sin(angle + side) * head
-            )
-            path.move(to: end)
-            path.addLine(to: p)
-          }
-        }
-      }
-      .stroke(tint ?? Theme.Palette.elementStroke, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-      .shadow(color: Theme.Palette.elementShadow, radius: 6, y: 3)
-    }
-  }
-}
-
-private struct FreehandShape: View {
-  let points: [CanvasPoint]
-  var tint: Color?
-
-  var body: some View {
-    GeometryReader { geo in
-      Path { path in
-        let mapped = points.map { CGPoint(x: $0.x * geo.size.width, y: $0.y * geo.size.height) }
-        guard let first = mapped.first else { return }
-        path.move(to: first)
-        for point in mapped.dropFirst() { path.addLine(to: point) }
-      }
-      .stroke(tint ?? Theme.Palette.elementStroke, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-      .shadow(color: Theme.Palette.elementShadow, radius: 6, y: 3)
-    }
-  }
-}
-
+/// A pen path as SwiftUI shapes — only for the one path under edit (see `BoardCardView`). Stroke
+/// and shadow scale with the zoom so it matches the renderer's drawing of the same path.
 private struct VectorPathShape: View {
   let spec: VectorPathSpec
   var tint: Color?
+  var zoom: CGFloat = 1
 
   var body: some View {
     GeometryReader { geo in
@@ -894,9 +375,9 @@ private struct VectorPathShape: View {
         }
         path.stroke(
           tint ?? Theme.Palette.elementStroke,
-          style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+          style: StrokeStyle(lineWidth: 3 * zoom, lineCap: .round, lineJoin: .round))
       }
-      .shadow(color: Theme.Palette.elementShadow, radius: 6, y: 3)
+      .shadow(color: Theme.Palette.elementShadow, radius: 6 * zoom, y: 3 * zoom)
     }
   }
 }
@@ -955,7 +436,7 @@ struct GraphGeometry {
 
 /// Parsed-expression cache keyed by the raw LaTeX string, so a resize/zoom/re-render never re-parses
 /// the same expression. A boxed optional distinguishes "cached as unparseable" from "not yet tried".
-private enum GraphExpressionCache {
+enum GraphExpressionCache {
   private final class Box { let value: GraphExpression?; init(_ v: GraphExpression?) { value = v } }
   private static let cache: NSCache<NSString, Box> = {
     let c = NSCache<NSString, Box>()
@@ -1228,7 +709,7 @@ struct GraphCardView: View {
     }
   }
 
-  private static func axisTitle(label: String, unit: String) -> String {
+  static func axisTitle(label: String, unit: String) -> String {
     let l = label.trimmingCharacters(in: .whitespacesAndNewlines)
     let u = unit.trimmingCharacters(in: .whitespacesAndNewlines)
     if l.isEmpty && u.isEmpty { return "" }
@@ -1238,14 +719,14 @@ struct GraphCardView: View {
   }
 
   /// Drop a trailing `.0` so integer ticks read cleanly.
-  private static func tickText(_ value: Double) -> String {
+  static func tickText(_ value: Double) -> String {
     let rounded = (value * 1000).rounded() / 1000
     if rounded == rounded.rounded() { return String(Int(rounded)) }
     return String(format: "%g", rounded)
   }
 
   /// A "nice" tick sequence (1/2/5 × 10ⁿ step) targeting ~4–6 ticks across the range.
-  private static func niceTicks(min lo: Double, max hi: Double) -> [Double] {
+  static func niceTicks(min lo: Double, max hi: Double) -> [Double] {
     guard hi > lo else { return [lo] }
     let step = niceStep((hi - lo) / 5)
     guard step > 0 else { return [lo, hi] }
@@ -1400,8 +881,8 @@ private struct GraphInteractionOverlay: View {
       // hit-testable: presses there reach the board (move the graph, drag a marker, ⌥-click).
       .onReceive(CanvasPointerHover.shared.$boardPoint) { boardPoint in
         guard let boardPoint else { hover = nil; return }
-        let local = CGPoint(x: (boardPoint.x - cardOrigin.x) * zoom - 2,
-                            y: (boardPoint.y - cardOrigin.y) * zoom - 2)
+        // This layer is laid out in board units (the parent scales it by the zoom).
+        let local = CGPoint(x: boardPoint.x - cardOrigin.x - 2, y: boardPoint.y - cardOrigin.y - 2)
         hover = geom.contains(local) ? readout(at: local, geom: geom) : nil
       }
     }
@@ -1465,6 +946,8 @@ private struct GraphInteractionOverlay: View {
       .fixedSize()
       .alignmentGuide(.leading) { d in flipX ? d.width : 0 }
       .alignmentGuide(.top) { d in flipY ? 0 : d.height }
+      // The readout keeps its on-screen size at any zoom; only its anchor rides the plot.
+      .scaleEffect(1 / max(zoom, 0.01))
       .position(x: readout.view.x + (flipX ? -12 : 12),
                 y: readout.view.y + (flipY ? 12 : -12))
       .allowsHitTesting(false)
@@ -1621,86 +1104,6 @@ private struct PointComposerStrip: View {
   }
 }
 
-private struct ImageObjectPlaceholder: View {
-  let path: String?
-  @State private var image: NSImage?
-  /// When set (offscreen PNG export), image decoding is synchronous: `ImageRenderer` never runs
-  /// the async `.task`, so the on-canvas placeholder would be captured instead of the picture.
-  /// The provider hands back a fully-decoded `NSImage` for `path` on the spot.
-  @Environment(\.exportImageProvider) private var exportImageProvider
-
-  /// The image to draw. During export it resolves synchronously from the provider; on the live
-  /// canvas it's the async-loaded thumbnail held in `@State`.
-  private var resolvedImage: NSImage? {
-    if let exportImageProvider, let path { return exportImageProvider(path) }
-    return image
-  }
-
-  var body: some View {
-    GeometryReader { proxy in
-      Group {
-        if let image = resolvedImage {
-          Image(nsImage: image)
-            .resizable()
-            .scaledToFill()
-            // `scaledToFill` may choose an aspect-derived child size larger than its proposal. An
-            // exact frame makes the following clip use the card bounds (the same bounds read by
-            // selection chrome) instead of the overflowing image's intrinsic fill height.
-            .frame(width: proxy.size.width, height: proxy.size.height)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-              .strokeBorder(Theme.Palette.panelHairline, lineWidth: 1))
-            .shadow(color: Theme.Palette.elementShadow.opacity(0.18), radius: 10, y: 4)
-        } else {
-          RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(Theme.Palette.elementFill)
-            .overlay {
-              VStack(spacing: 8) {
-                Image(systemName: "photo")
-                  .font(.system(size: 24, weight: .medium))
-                Text(path.map { ($0 as NSString).lastPathComponent } ?? "Image".localizedUI)
-                  .font(.caption.weight(.medium))
-                  .lineLimit(1)
-              }
-              .foregroundStyle(Theme.Palette.chromeText)
-              .padding(10)
-            }
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-              .strokeBorder(Theme.Palette.chromeDivider, style: StrokeStyle(lineWidth: 1.5, dash: [6, 5])))
-            .shadow(color: Theme.Palette.elementShadow.opacity(0.18), radius: 10, y: 4)
-        }
-      }
-      .frame(width: proxy.size.width, height: proxy.size.height)
-    }
-    // `.task(id:)` runs on appear AND whenever `path` changes, and is cancelled on disappear — so a
-    // card reloaded from a saved board (or culled and re-added while panning) reliably re-decodes,
-    // instead of the old `.onAppear` + stored-path guard silently dropping the result.
-    .task(id: path) {
-      // Export resolves synchronously through the provider — no async decode needed.
-      guard exportImageProvider == nil else { return }
-      guard let path else { image = nil; return }
-      let loaded: NSImage? = await withCheckedContinuation { continuation in
-        CanvasImageCache.shared.load(path: path) { continuation.resume(returning: $0) }
-      }
-      if !Task.isCancelled { image = loaded }
-    }
-  }
-}
-
-/// Offscreen-export hook: when present, image cards resolve their picture synchronously from this
-/// closure instead of the async `CanvasImageCache`, so a one-shot `ImageRenderer` capture shows the
-/// real image rather than the loading placeholder. Nil on the live canvas — normal async loading.
-private struct ExportImageProviderKey: EnvironmentKey {
-  static let defaultValue: ((String) -> NSImage?)? = nil
-}
-
-extension EnvironmentValues {
-  var exportImageProvider: ((String) -> NSImage?)? {
-    get { self[ExportImageProviderKey.self] }
-    set { self[ExportImageProviderKey.self] = newValue }
-  }
-}
-
 // MARK: - Equation (LaTeX) rendering
 
 /// A LaTeX math-mode equation, typeset natively by SwiftMath (CoreText, not a web view) into an
@@ -1790,66 +1193,14 @@ private final class EquationImageCache {
 
   /// Typeset at 2× the target size for Retina crispness (the view aspect-fits it back down).
   private static func render(latex: String, ink: NSColor, fontSize: CGFloat) -> NSImage? {
+    // SwiftMath's typesetting state is shared with the board renderer's background threads.
+    EquationRaster.lock.lock()
+    defer { EquationRaster.lock.unlock() }
     let mathImage = MTMathImage(latex: latex, fontSize: fontSize * 2, textColor: ink,
                                 labelMode: .display, textAlignment: .center)
     let (error, image) = mathImage.asImage()
     guard error == nil, let image, image.size.width > 0, image.size.height > 0 else { return nil }
     return image
-  }
-}
-
-/// A bounded, asynchronous thumbnail cache. The previous cache kept the full source image for
-/// every visited card and decoded it synchronously from `body`, which made panning into a board
-/// of large screenshots both a main-thread hitch and an unbounded memory grower.
-private final class CanvasImageCache {
-  static let shared = CanvasImageCache()
-  private let cache = NSCache<NSString, NSImage>()
-  private let decodeQueue = DispatchQueue(label: "dev.jow.Composer.canvas-image-decode", qos: .userInitiated)
-  private var pending: [String: [(NSImage?) -> Void]] = [:]
-
-  private static let maximumPixelDimension = 1_536
-
-  private init() {
-    cache.countLimit = 48
-    cache.totalCostLimit = 48 * 1_024 * 1_024
-  }
-
-  func load(path: String, completion: @escaping (NSImage?) -> Void) {
-    let key = path as NSString
-    if let cached = cache.object(forKey: key) {
-      completion(cached)
-      return
-    }
-    if pending[path] != nil {
-      pending[path, default: []].append(completion)
-      return
-    }
-    pending[path] = [completion]
-    decodeQueue.async { [weak self] in
-      let decoded = Self.decodeThumbnail(at: path)
-      DispatchQueue.main.async {
-        guard let self else { return }
-        if let image = decoded?.image {
-          self.cache.setObject(image, forKey: key, cost: decoded?.cost ?? 0)
-        }
-        let callbacks = self.pending.removeValue(forKey: path) ?? []
-        callbacks.forEach { $0(decoded?.image) }
-      }
-    }
-  }
-
-  private static func decodeThumbnail(at path: String) -> (image: NSImage, cost: Int)? {
-    guard let url = AssetStore.resolve(path) else { return nil }
-    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-    let options: [CFString: Any] = [
-      kCGImageSourceCreateThumbnailFromImageAlways: true,
-      kCGImageSourceCreateThumbnailWithTransform: true,
-      kCGImageSourceThumbnailMaxPixelSize: maximumPixelDimension,
-      kCGImageSourceShouldCacheImmediately: true,
-    ]
-    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-    let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-    return (image, cgImage.bytesPerRow * cgImage.height)
   }
 }
 

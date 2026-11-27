@@ -40,6 +40,16 @@ under the new version heading.
   - Shift-drag moves along one axis.
   - Switching boards moves to ⌥⌘[ / ⌥⌘].
 - **Zoom to fit centres the board** instead of pinning it to the top-left corner.
+- **The canvas stays fast with thousands of elements.** Elements are drawn once into cached tiles
+  and moved by the GPU, instead of each being a live view that was laid out again on every pan,
+  zoom, and drag. On a 5,000-element board a frame of panning, zooming, or dragging now takes about
+  a millisecond; before, a few dozen elements were enough to drop frames. Export draws with the
+  same code, so an exported image matches the screen.
+- **Zooming scales the board at once and sharpens it a moment later,** instead of laying out
+  every element again at each step.
+- **Elements you drag ride above the rest until you let go,** then settle back into their layer.
+- **Selecting more than 200 elements shows one box around the group** rather than an outline per
+  element.
 
 ### Fixed
 

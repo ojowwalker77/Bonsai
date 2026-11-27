@@ -182,7 +182,7 @@ final class CanvasSelectGesture {
 
     // Chrome and content act on every click of a sequence: two quick clicks on a port make two
     // linked shapes, two on a checkbox toggle it twice. Only then is a double-click an edit.
-    let chrome = currentChrome(viewport: viewport, rendered: rendered)
+    let chrome = board.selectionChrome(viewport: viewport, interactive: true)
     if let chromeHit = chrome.hit(point) {
       pending(.chrome(chromeHit))
       return
@@ -353,8 +353,7 @@ final class CanvasSelectGesture {
   /// What the pointer is over while no button is down.
   func hover(at point: CGPoint) -> CanvasHoverCursor {
     let viewport = viewport()
-    let rendered = board.renderedCards
-    switch currentChrome(viewport: viewport, rendered: rendered).hit(point) {
+    switch board.selectionChrome(viewport: viewport, interactive: true).hit(point) {
     case .handle(let handle): return .resize(handle)
     case .endpoint: return .endpoint
     case .quickConnect: return .port
@@ -474,12 +473,6 @@ final class CanvasSelectGesture {
   }
 
   // MARK: Chrome
-
-  private func currentChrome(viewport: CanvasViewport, rendered: [CardState]) -> SelectionChrome {
-    let selected = rendered.filter { board.selectedCardIDs.contains($0.id) }
-    return SelectionChrome.resolve(selected: selected, editingID: board.editingCardID,
-                                   viewport: viewport, interactive: true)
-  }
 
   // MARK: Resize
 
@@ -630,8 +623,10 @@ final class CanvasSelectGesture {
     let scale = viewport.safeScale
     let local = CGPoint(x: (boardPoint.x - card.x) * scale, y: (boardPoint.y - card.y) * scale)
 
-    if modifiers.isEmpty, card.elementKind == .checklist || card.elementKind == .text,
-       let measured = board.checkboxFrames[card.id] {
+    // The boxes sit exactly where the renderer lays them out (card-local board units).
+    let measured = modifiers.isEmpty && (card.elementKind == .checklist || card.elementKind == .text)
+      ? RenderElement.checkboxFrames(for: card, text: board.renderText(for: card)) : [:]
+    if !measured.isEmpty {
       // Checkbox targets have a screen-space minimum, so compare in screen units.
       let frames = measured.mapValues { rect in
         CGRect(x: rect.minX * scale, y: rect.minY * scale, width: rect.width * scale, height: rect.height * scale)
@@ -650,10 +645,12 @@ final class CanvasSelectGesture {
     }
 
     if card.elementKind == .graph, let spec = card.graph,
-       let plot = graphGeometry(for: card, spec: spec, local: local, scale: scale) {
+       let plot = graphGeometry(for: card, spec: spec, boardPoint: boardPoint) {
       let (geometry, plotPoint) = plot
+      // Markers are drawn in board units; keep a comfortable target once zoomed out.
+      let markerSlop = max(14, 10 / scale)
       if modifiers.contains(.option) {
-        if let marker = markerHit(spec: spec, geometry: geometry, at: plotPoint) {
+        if let marker = markerHit(spec: spec, geometry: geometry, at: plotPoint, slop: markerSlop) {
           board.removeGraphPoint(card.id, seriesID: marker.seriesID, index: marker.index)
         } else if geometry.contains(plotPoint) {
           callbacks.openPointComposer(card.id, geometry.rounded(geometry.clampedData(plotPoint)))
@@ -663,7 +660,7 @@ final class CanvasSelectGesture {
         return .some(nil)
       }
       if board.selectedCardIDs.contains(card.id),
-         let marker = markerHit(spec: spec, geometry: geometry, at: plotPoint),
+         let marker = markerHit(spec: spec, geometry: geometry, at: plotPoint, slop: markerSlop),
          let value = spec.series.first(where: { $0.id == marker.seriesID })?.points?[marker.index] {
         return .graphMarker(GraphMarker(graphID: card.id, seriesID: marker.seriesID, index: marker.index,
                                         origin: value, startPointer: pointer, current: value))
@@ -672,24 +669,25 @@ final class CanvasSelectGesture {
     return nil
   }
 
-  /// The graph's plot geometry at the card's current screen size (GraphCardView renders inside a
-  /// 2pt inset), plus the point in that plot space.
+  /// The graph's plot geometry in board units (a graph is laid out at 100% inside a 2pt inset and
+  /// scaled by the zoom, like every element), plus the point in that plot space.
   private func graphGeometry(for card: CardState,
                              spec: CardState.GraphSpec,
-                             local: CGPoint,
-                             scale: CGFloat) -> (GraphGeometry, CGPoint)? {
-    let size = CGSize(width: card.w * scale - 4, height: card.h * scale - 4)
+                             boardPoint: CGPoint) -> (GraphGeometry, CGPoint)? {
+    let size = CGSize(width: card.w - 4, height: card.h - 4)
     guard size.width > 1, size.height > 1 else { return nil }
-    return (GraphGeometry(spec: spec, size: size), CGPoint(x: local.x - 2, y: local.y - 2))
+    return (GraphGeometry(spec: spec, size: size),
+            CGPoint(x: boardPoint.x - card.x - 2, y: boardPoint.y - card.y - 2))
   }
 
   private func markerHit(spec: CardState.GraphSpec,
                          geometry: GraphGeometry,
-                         at point: CGPoint) -> (seriesID: UUID, index: Int)? {
+                         at point: CGPoint,
+                         slop: CGFloat) -> (seriesID: UUID, index: Int)? {
     for series in spec.series {
       for (index, value) in (series.points ?? []).enumerated() {
         let marker = geometry.viewPoint(value)
-        if hypot(marker.x - point.x, marker.y - point.y) <= 14 { return (series.id, index) }
+        if hypot(marker.x - point.x, marker.y - point.y) <= slop { return (series.id, index) }
       }
     }
     return nil
@@ -703,12 +701,13 @@ final class CanvasSelectGesture {
           let seriesIndex = spec.series.firstIndex(where: { $0.id == marker.seriesID }),
           var points = spec.series[seriesIndex].points, points.indices.contains(marker.index) else { return nil }
     let scale = viewport.safeScale
-    let size = CGSize(width: card.w * scale - 4, height: card.h * scale - 4)
+    let size = CGSize(width: card.w - 4, height: card.h - 4)
     guard size.width > 1, size.height > 1 else { return nil }
     let geometry = GraphGeometry(spec: spec, size: size)
     let start = geometry.viewPoint(marker.origin)
-    let moved = CGPoint(x: start.x + point.x - marker.startPointer.x,
-                        y: start.y + point.y - marker.startPointer.y)
+    // Pointer travel is in screen points; the plot is in board units.
+    let moved = CGPoint(x: start.x + (point.x - marker.startPointer.x) / scale,
+                        y: start.y + (point.y - marker.startPointer.y) / scale)
     // Only the coordinates move; the point keeps its own label and tint.
     var value = geometry.rounded(geometry.clampedData(moved))
     value.label = marker.origin.label
