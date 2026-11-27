@@ -11,6 +11,8 @@ under the new version heading.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-27
+
 ### Changed
 
 - **BonsAI is now a focused canvas board that your agents drive over a local server.** External
